@@ -1,4 +1,9 @@
 {
+	"ProtocolType" :"AMQP|UDP",
+	"BinaryProtocol": {
+		"Address": ":25826",
+	    "CollectdTypesDBFile": ""
+	},
 	"AMQP1MetricURL": "127.0.0.1:5672/collectd/telemetry",
 	"Exporterhost": "localhost",
 	"Exporterport": 8081,

@@ -46,6 +46,11 @@ ignored = ["github.com/redhat-nfvpe/telemetry-consumers"]
   revision = "b25d21e6779a011e972a5f00e433e2034b793da1"
   name = "qpid.apache.org"
 
+[[constraint]]
+  revision = "606bd390f38f050824c77208d6715ed59e3692ac"
+  name = "collectd.org"
+
+
 [prune]
   go-tests = true
   unused-packages = true

@@ -18,7 +18,8 @@ script:
 - "$GOPATH/bin/dep ensure -v --vendor-only"
 - go vet ./cmd/metrics/metrics.go
 - go vet ./cmd/events/events.go
-- golint . | xargs -r false
+#- golint . | xargs -r false
+- golint `go list ./... | grep -v /vendor/`
 before_deploy:
 - docker login -u $REGISTRY_USER -p $REGISTRY_PASS
 - docker build --tag nfvpe/smart_agent_builder:latest -f build/docker/builder/Dockerfile .

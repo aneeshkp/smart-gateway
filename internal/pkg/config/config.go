@@ -27,8 +27,16 @@ type EventAPIConfig struct {
 	AMQP1PublishURL string // new amqp address to send notifications
 }
 
+//BinaryProtocol ...
+type BinaryProtocolConfig struct {
+	Address             string // UDP port listener
+	CollectdTypesDBFile string // Collectd typesdb path for parsing binary protocol
+}
+
 //MetricConfiguration   ....
 type MetricConfiguration struct {
+	ProtocolType   string
+	BinaryProtocol BinaryProtocolConfig
 	Debug          bool
 	TestServer     bool
 	AMQP1MetricURL string

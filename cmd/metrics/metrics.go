@@ -10,6 +10,7 @@ import (
 	"github.com/redhat-nfvpe/telemetry-consumers/internal/pkg/cacheutil"
 	"github.com/redhat-nfvpe/telemetry-consumers/internal/pkg/config"
 	"github.com/redhat-nfvpe/telemetry-consumers/internal/pkg/incoming"
+	"github.com/redhat-nfvpe/telemetry-consumers/internal/pkg/udp"
 
 	"flag"
 	"fmt"
@@ -23,11 +24,13 @@ import (
 
 var (
 	cacheServer      cacheutil.CacheServer
+	udpMetricServer  *udp.UDPServer
 	amqpMetricServer *amqp10.AMQPServer
 	debugm           = func(format string, data ...interface{}) {} // Default no debugging output
 	debugs           = func(count int) {}                          // Default no debugging output
 	serverConfig     saconfig.MetricConfiguration
 	amqpHandler      *amqp10.AMQPHandler
+	udpHandler       *udp.UDPHandler
 	myHandler        *cacheHandler
 	hostwaitgroup    sync.WaitGroup
 )
@@ -86,10 +89,14 @@ func metricusage() {
 	**************************************************
 	For running with AMQP and Prometheus use following option
 	********************* Production *********************
-	$go run metrics/main.go -mhost=localhost -mport=8081 -amqp1MetricURL=10.19.110.5:5672/collectd/telemetry
+	$go run metrics/main.go -mhost=localhost -mport=8081 -protocol AMQP -amqp1MetricURL=10.19.110.5:5672/collectd/telemetry
+	**************************************************************
+	For running with UDP and Prometheus use following option
+	********************* Production *********************
+	$go run metrics/main.go -mhost=localhost -mport=8081 -protocol UDP -udp-address=:25826
 	**************************************************************
 
-	For running Sample data wihout AMQP use following option
+	For running Sample data wihout AMQP/UDP use following option
 	********************* Sample Data *********************
 	$go run metrics/main.go -mhost=localhost -mport=8081 -usesample=true -h=10 -p=100 -t=-1 -debug
 	*************************************************************`)
@@ -121,12 +128,16 @@ func main() {
 	// set flags for parsing options
 	flag.Usage = metricusage
 	fDebug := flag.Bool("debug", false, "Enable debug")
+	fProtocol := flag.String("protocol", "AMQP", "Listener can be either  AMQP or UDP (default AMQP")
+	fUDPAddress := flag.String("udp-address", ":25826", "(use with protocol AMQP) UDP address and port (default :25826)")
+	fCollectdTypesDbFile := flag.String("typed-db", "", "Path to types db file if using UDP protocol")
+
 	fTestServer := flag.Bool("testclient", false, "Enable Test Receiver for use with AMQP test client")
 	fConfigLocation := flag.String("config", "", "Path to configuration file(optional).if provided ignores all command line options")
 	fIncludeStats := flag.Bool("cpustats", false, "Include cpu usage info in http requests (degrades performance)")
 	fExporterhost := flag.String("mhost", "localhost", "Metrics url for Prometheus to export. ")
 	fExporterport := flag.Int("mport", 8081, "Metrics port for Prometheus to export (http://localhost:<port>/metrics) ")
-	fAMQP1MetricURL := flag.String("amqp1MetricURL", "", "AMQP1.0 metrics listener example 127.0.0.1:5672/collectd/telemetry")
+	fAMQP1MetricURL := flag.String("amqp1MetricURL", "", "(use with protocol AMQP)AMQP1.0 metrics listener example 127.0.0.1:5672/collectd/telemetry")
 	fCount := flag.Int("count", -1, "Stop after receiving this many messages in total(-1 forever) (OPTIONAL)")
 	fPrefetch := flag.Int("prefetch", 0, "AMQP1.0 option: Enable prefetc and set capacity(0 is disabled,>0 enabled with capacity of >0) (OPTIONAL)")
 
@@ -144,6 +155,7 @@ func main() {
 		}
 	} else {
 		serverConfig = saconfig.MetricConfiguration{
+			ProtocolType:   *fProtocol,
 			AMQP1MetricURL: *fAMQP1MetricURL,
 			CPUStats:       *fIncludeStats,
 			Exporterhost:   *fExporterhost,
@@ -153,6 +165,10 @@ func main() {
 			Debug:          *fDebug,
 			TestServer:     *fTestServer,
 			Prefetch:       *fPrefetch,
+			BinaryProtocol: saconfig.BinaryProtocolConfig{
+				Address:             *fUDPAddress,
+				CollectdTypesDBFile: *fCollectdTypesDbFile,
+			},
 			Sample: saconfig.SampleDataConfig{
 				HostCount:   *fHosts,   //no of host to simulate
 				PluginCount: *fPlugins, //No of plugin count per hosts
@@ -165,11 +181,29 @@ func main() {
 		debugm = func(format string, data ...interface{}) { log.Printf(format, data...) }
 	}
 
-	if serverConfig.TestServer == false &&
+	if serverConfig.TestServer == false && serverConfig.ProtocolType == "AMQP" &&
 		serverConfig.UseSample == false && (len(serverConfig.AMQP1MetricURL) == 0) {
 		log.Println("AMQP1 Metrics URL is required")
 		metricusage()
 		os.Exit(1)
+	}
+
+	if serverConfig.TestServer == false && serverConfig.ProtocolType == "UDP" &&
+		serverConfig.UseSample == false && (len(serverConfig.BinaryProtocol.Address) == 0) {
+		log.Println("UDP address is required")
+		metricusage()
+		os.Exit(1)
+	}
+	if serverConfig.ProtocolType == "UDP" && serverConfig.BinaryProtocol.CollectdTypesDBFile != "" {
+		file, err := os.Open(*fCollectdTypesDbFile)
+		if err != nil {
+			log.Fatalf("Can't open types.db file %s", *fCollectdTypesDbFile)
+		}
+		defer file.Close()
+
+		if err != nil {
+			log.Fatalf("Error in parsing types.db file %s", *fCollectdTypesDbFile)
+		}
 	}
 
 	//Block -starts
@@ -191,8 +225,16 @@ func main() {
 	applicationHealth := cacheutil.NewApplicationHealthCache()
 	appStateHandler := apihandler.NewAppStateMetricHandler(applicationHealth)
 	myHandler := &cacheHandler{cache: cacheServer.GetCache(), appstate: appStateHandler}
-	amqpHandler := amqp10.NewAMQPHandler("Metric Consumer")
-	prometheus.MustRegister(myHandler, amqpHandler)
+	if serverConfig.ProtocolType == "AMQP" {
+		amqpHandler = amqp10.NewAMQPHandler("Metric Consumer")
+		prometheus.MustRegister(myHandler, amqpHandler)
+		debugm("Debug: AMQP handler")
+	} else {
+		udpHandler = udp.NewUDPHandler("Metric Consumer")
+		prometheus.MustRegister(myHandler, udpHandler)
+		udpHandler.IncTotalMsgRcv()
+		debugm("Debug: UDP handler %d", udpHandler.GetTotalMsgRcv())
+	}
 
 	if serverConfig.CPUStats == false {
 		// Including these stats kills performance when Prometheus polls with multiple targets
@@ -253,39 +295,66 @@ func main() {
 		}
 
 	} else {
-		//aqp listener if sample is requested then amqp will not be used but random sample data will be used
-		var amqpMetricServer *amqp10.AMQPServer
-
 		// done channel is used during serverTest
 		done := make(chan bool)
 
-		///Metric Listener
-		amqpMetricsurl := fmt.Sprintf("amqp://%s", serverConfig.AMQP1MetricURL)
-		log.Printf("Connecting to AMQP1 : %s\n", amqpMetricsurl)
-		amqpMetricServer = amqp10.NewAMQPServer(amqpMetricsurl, serverConfig.Debug, serverConfig.DataCount, serverConfig.Prefetch, amqpHandler, done, *fTestServer)
-		log.Printf("Listening.....\n")
+		if serverConfig.ProtocolType == "UDP" {
 
-		if serverConfig.TestServer == true {
-			debugs = getLoopStater(amqpMetricServer.GetNotifier(), 10000)
-		}
-
-	msgloop:
-		for {
-			select {
-			case data := <-amqpMetricServer.GetNotifier():
-				amqpMetricServer.GetHandler().IncTotalMsgProcessed()
-				debugm("Debug: Getting incoming data from notifier channel : %#v\n", data)
-				incomingType := incoming.NewInComing(incoming.COLLECTD)
-				metrics, _ := incomingType.ParseInputJSON(data)
-				for _, m := range metrics {
-					cacheServer.Put(m)
+			udpMetricServer = udp.NewUDPServer(serverConfig.BinaryProtocol.Address,
+				serverConfig.Debug, serverConfig.DataCount,
+				udpHandler, serverConfig.BinaryProtocol.CollectdTypesDBFile, done)
+			log.Printf("Listening to UDP.....\n")
+			udpMetricServer.GetUDPHandler().GetTotalMsgRcv()
+		udpMsgloop:
+			for {
+				select {
+				case data := <-udpMetricServer.GetNotifier():
+					udpMetricServer.GetUDPHandler().IncTotalMsgProcessed()
+					debugm("Debug: Getting incoming data from notifier channel : %#v\n", data)
+					incomingType := incoming.NewInComing(incoming.COLLECTD)
+					metrics, _ := incomingType.ParseInputJSON(data)
+					for _, m := range metrics {
+						cacheServer.Put(m)
+					}
+					debugs(len(metrics))
+					continue // priority channel
+				case status := <-udpMetricServer.GetStatus():
+					applicationHealth.QpidRouterState = status
+				case <-done:
+					break udpMsgloop
 				}
-				debugs(len(metrics))
-				continue // priority channel
-			case status := <-amqpMetricServer.GetStatus():
-				applicationHealth.QpidRouterState = status
-			case <-done:
-				break msgloop
+			}
+
+		} else {
+
+			///Metric Listener
+			amqpMetricsurl := fmt.Sprintf("amqp://%s", serverConfig.AMQP1MetricURL)
+			log.Printf("Connecting to AMQP1 : %s\n", amqpMetricsurl)
+			amqpMetricServer = amqp10.NewAMQPServer(amqpMetricsurl, serverConfig.Debug, serverConfig.DataCount, serverConfig.Prefetch, amqpHandler, done, *fTestServer)
+			log.Printf("Listening.....\n")
+
+			if serverConfig.TestServer == true {
+				debugs = getLoopStater(amqpMetricServer.GetNotifier(), 10000)
+			}
+
+		msgloop:
+			for {
+				select {
+				case data := <-amqpMetricServer.GetNotifier():
+					amqpMetricServer.GetHandler().IncTotalMsgProcessed()
+					debugm("Debug: Getting incoming data from notifier channel : %#v\n", data)
+					incomingType := incoming.NewInComing(incoming.COLLECTD)
+					metrics, _ := incomingType.ParseInputJSON(data)
+					for _, m := range metrics {
+						cacheServer.Put(m)
+					}
+					debugs(len(metrics))
+					continue // priority channel
+				case status := <-amqpMetricServer.GetStatus():
+					applicationHealth.QpidRouterState = status
+				case <-done:
+					break msgloop
+				}
 			}
 		}
 	}
